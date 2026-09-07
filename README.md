@@ -43,7 +43,7 @@ Sign up with any email → click SPEAK → record yourself → get feedback in 1
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │                        USER BROWSER                          │
-│               https://speakwell-pi.vercel.app                │
+│              https://speakwell-live.vercel.app               │
 └───────────────────────────┬──────────────────────────────────┘
                             │ HTTPS
                             ▼
@@ -90,11 +90,12 @@ Sign up with any email → click SPEAK → record yourself → get feedback in 1
 5. Worker downloads audio from Supabase Storage to `/tmp/`
 6. RMS energy check rejects silence before calling any AI
 7. Groq Whisper transcribes audio (~0.2s on Groq's GPU)
-8. Groq Llama analyzes transcript — grammar, fillers, scores, corrections
-9. gTTS generates two audio files → uploaded to Supabase Storage
-10. Session saved to Supabase PostgreSQL
-11. Frontend polls `GET /api/audio/task/{id}` every 2 seconds until done
-12. Results rendered — transcript, scores, corrections, three audio players
+8. Groq Llama analyzes transcript — grammar, scores, corrections
+9. Filler words counted deterministically from Whisper's word segments — no LLM
+10. gTTS generates two audio files → uploaded to Supabase Storage
+11. Session saved to Supabase PostgreSQL
+12. Frontend polls `GET /api/audio/task/{id}` every 2 seconds until done
+13. Results rendered — transcript, scores, corrections, three audio players
 
 ---
 
@@ -132,6 +133,45 @@ Sign up with any email → click SPEAK → record yourself → get feedback in 1
 | Railway | Backend + Celery worker + Redis |
 | Supabase | PostgreSQL + Storage + Auth |
 | Docker + Docker Compose | Local development orchestration |
+
+---
+
+## Why It's Built This Way
+
+Five decisions that shaped the architecture, and the reasoning behind each:
+
+**The API returns in under 200ms and never waits for the AI.** Transcription,
+analysis and speech synthesis together take 10–15 seconds — far past any sensible
+HTTP timeout, and long enough that a dropped connection would lose the work
+entirely. So the upload endpoint does exactly two things: store the audio and
+queue a Celery task. The client gets a `task_id` immediately and polls. The cost
+is a polling loop and a Redis dependency; the benefit is that a request can't time
+out, and a worker crash loses one task rather than the user's recording.
+
+**A silence check runs before any AI call.** An RMS energy threshold rejects empty
+or near-silent recordings up front. Whisper will happily hallucinate confident
+text out of near-silence, so this isn't a cost optimization — it's what stops the
+product confidently grading a recording that contains nothing.
+
+**Speech-to-text and analysis are separate models, both on Groq.** Whisper
+transcribes, Llama analyzes. Keeping them separate means the analysis prompt
+receives clean text and can be iterated on without touching transcription, and
+Groq's inference speed is what makes a 10–15 second round trip feasible at all —
+the transcription step alone is ~0.2s on their hardware.
+
+**Filler-word detection is deterministic, not a model call.** Counting how often
+someone says "basically" is arithmetic over Whisper's word segments, and a
+`Counter` cannot miscount or invent a word the speaker never said. Two strategies
+run over that list: words that are always fillers (`um`, `uh`, `basically`), and
+words that only count as fillers once repeated past a threshold (`so`, `and`,
+`like` — normal English until they aren't). Leaving this to the LLM would trade a
+guaranteed-correct count for a plausible one.
+
+**Config is centralized and type-safe.** Every secret and setting goes through
+Pydantic `BaseSettings` rather than scattered `os.environ` reads, so a missing
+variable fails loudly at startup instead of surfacing as a confusing runtime error
+inside a Celery worker three containers away — which is exactly how it failed the
+first time.
 
 ---
 
